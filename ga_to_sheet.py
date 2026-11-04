@@ -15,16 +15,21 @@ from google.analytics.data_v1beta.types import (
     RunReportRequest,
 )
 
-# --------------------------------------------------
-# CONFIGURATION
-# --------------------------------------------------
+
+# ==================================================
+# 1. CONFIGURATION
+# ==================================================
 
 PROPERTY_ID = os.environ["GA_PROPERTY_ID"].strip()
 SHEET_ID = os.environ["SHEET_ID"].strip()
 
 DAYS_BACK = int(os.getenv("DAYS_BACK", "3"))
-MAIN_TAB = os.getenv("MAIN_TAB", "ga_data")
-ADS_TAB = os.getenv("ADS_TAB", "ga_ads_cost")
+
+MAIN_TAB = "ga_data"
+ADS_TAB = "ga_ads_cost"
+
+if DAYS_BACK < 1:
+    raise ValueError("DAYS_BACK must be at least 1.")
 
 SCOPES = [
     "https://www.googleapis.com/auth/analytics.readonly",
@@ -38,11 +43,10 @@ logging.basicConfig(
 )
 
 
-# --------------------------------------------------
-# GA4 REPORT CONFIGURATION
-# --------------------------------------------------
+# ==================================================
+# 2. GA4 DIMENSIONS
+# ==================================================
 
-# Main traffic and campaign report
 MAIN_DIMENSIONS = [
     "date",
     "sessionCampaignName",
@@ -50,6 +54,20 @@ MAIN_DIMENSIONS = [
     "sessionMedium",
     "sessionDefaultChannelGroup",
 ]
+
+
+ADS_DIMENSIONS = [
+    "date",
+    "sessionCampaignName",
+]
+
+
+# ==================================================
+# 3. GA4 METRICS
+# ==================================================
+
+# GA4 allows a maximum of 10 metrics per request.
+# Therefore, the main report is split into two requests.
 
 MAIN_METRICS = [
     "sessions",
@@ -62,25 +80,15 @@ MAIN_METRICS = [
     "screenPageViews",
     "eventCount",
     "keyEvents",
+]
+
+EXTRA_METRICS = [
     "purchaseRevenue",
     "totalRevenue",
 ]
 
-MAIN_KEYS = [
-    "date",
-    "sessionCampaignName",
-    "sessionSource",
-    "sessionMedium",
-    "sessionDefaultChannelGroup",
-]
 
-# Advertising cost report.
-# This is kept in a separate tab to avoid duplicating campaign spend
-# across multiple source/medium rows in the main report.
-ADS_DIMENSIONS = [
-    "date",
-    "sessionCampaignName",
-]
+# Advertising metrics are fetched separately.
 
 ADS_METRICS = [
     "advertiserAdCost",
@@ -90,18 +98,17 @@ ADS_METRICS = [
     "returnOnAdSpend",
 ]
 
-ADS_KEYS = [
-    "date",
-    "sessionCampaignName",
-]
+
+MAIN_KEYS = MAIN_DIMENSIONS.copy()
+
+ADS_KEYS = ADS_DIMENSIONS.copy()
 
 
-# --------------------------------------------------
-# AUTHENTICATION
-# --------------------------------------------------
+# ==================================================
+# 4. GOOGLE AUTHENTICATION
+# ==================================================
 
 def get_credentials():
-    """Load service account credentials from GitHub secret."""
 
     credentials_json = os.environ.get("GA_CREDENTIALS")
 
@@ -112,37 +119,41 @@ def get_credentials():
 
     if credentials_info.get("type") != "service_account":
         raise ValueError(
-            "GA_CREDENTIALS must contain service account JSON, "
-            "not an API key."
+            "GA_CREDENTIALS must contain service account JSON."
         )
 
-    return Credentials.from_service_account_info(
+    credentials = Credentials.from_service_account_info(
         credentials_info,
         scopes=SCOPES,
     )
 
+    return credentials
+
 
 def connect_services():
-    """Connect to GA4 and Google Sheets."""
 
     credentials = get_credentials()
+
+    logging.info("Connecting to GA4...")
 
     ga_client = BetaAnalyticsDataClient(
         credentials=credentials
     )
 
+    logging.info("Connecting to Google Sheets...")
+
     sheets_client = gspread.authorize(credentials)
 
     spreadsheet = sheets_client.open_by_key(SHEET_ID)
 
-    logging.info("Connected to GA4 and Google Sheets.")
+    logging.info("Connected successfully.")
 
     return ga_client, spreadsheet
 
 
-# --------------------------------------------------
-# GA4 DATA EXTRACTION
-# --------------------------------------------------
+# ==================================================
+# 5. GENERIC GA4 REPORT FUNCTION
+# ==================================================
 
 def fetch_ga4_report(
     client,
@@ -151,12 +162,9 @@ def fetch_ga4_report(
     start_date,
     end_date,
 ):
-    """
-    Fetch a GA4 report, including pagination.
-    Returns a pandas DataFrame.
-    """
 
     all_rows = []
+
     offset = 0
     limit = 100000
 
@@ -164,20 +172,24 @@ def fetch_ga4_report(
 
         request = RunReportRequest(
             property=f"properties/{PROPERTY_ID}",
+
             dimensions=[
                 Dimension(name=name)
                 for name in dimensions
             ],
+
             metrics=[
                 Metric(name=name)
                 for name in metrics
             ],
+
             date_ranges=[
                 DateRange(
                     start_date=start_date,
                     end_date=end_date,
                 )
             ],
+
             limit=limit,
             offset=offset,
         )
@@ -188,12 +200,16 @@ def fetch_ga4_report(
 
             record = {}
 
+            # Dimensions
             for index, dimension in enumerate(dimensions):
+
                 record[dimension] = (
                     row.dimension_values[index].value
                 )
 
+            # Metrics
             for index, metric in enumerate(metrics):
+
                 record[metric] = (
                     row.metric_values[index].value
                 )
@@ -201,7 +217,7 @@ def fetch_ga4_report(
             all_rows.append(record)
 
         logging.info(
-            "Fetched %s rows. Total so far: %s",
+            "Fetched %s rows. Total: %s",
             len(response.rows),
             len(all_rows),
         )
@@ -214,16 +230,20 @@ def fetch_ga4_report(
     return pd.DataFrame(all_rows)
 
 
+# ==================================================
+# 6. FETCH MAIN GA4 DATA
+# ==================================================
+
 def pull_main_data(client):
-    """Fetch the main GA4 traffic and campaign report."""
 
     today = date.today()
 
-    # Exclude today because GA4 data for today may be incomplete.
+    # Exclude today's incomplete data.
     end_date = today - timedelta(days=1)
 
-    # DAYS_BACK=3 means the previous three complete days.
-    start_date = end_date - timedelta(days=DAYS_BACK - 1)
+    start_date = end_date - timedelta(
+        days=DAYS_BACK - 1
+    )
 
     logging.info(
         "Fetching main GA4 data from %s to %s",
@@ -231,7 +251,13 @@ def pull_main_data(client):
         end_date,
     )
 
-    df = fetch_ga4_report(
+    # ----------------------------------------------
+    # REQUEST 1: First 10 metrics
+    # ----------------------------------------------
+
+    logging.info("Fetching main metrics...")
+
+    df_main = fetch_ga4_report(
         client=client,
         dimensions=MAIN_DIMENSIONS,
         metrics=MAIN_METRICS,
@@ -239,23 +265,80 @@ def pull_main_data(client):
         end_date=end_date.isoformat(),
     )
 
-    return df
+    if df_main.empty:
+        logging.warning("No main GA4 data found.")
+        return pd.DataFrame()
 
+    # ----------------------------------------------
+    # REQUEST 2: Remaining 2 metrics
+    # ----------------------------------------------
 
-def pull_ads_data(client):
-    """Fetch advertising cost, clicks and impressions."""
+    logging.info("Fetching revenue metrics...")
 
-    today = date.today()
-    end_date = today - timedelta(days=1)
-    start_date = end_date - timedelta(days=DAYS_BACK - 1)
+    df_extra = fetch_ga4_report(
+        client=client,
+        dimensions=MAIN_DIMENSIONS,
+        metrics=EXTRA_METRICS,
+        start_date=start_date.isoformat(),
+        end_date=end_date.isoformat(),
+    )
+
+    # ----------------------------------------------
+    # MERGE BOTH REPORTS
+    # ----------------------------------------------
+
+    if not df_extra.empty:
+
+        df_main = df_main.merge(
+            df_extra,
+            on=MAIN_DIMENSIONS,
+            how="left",
+        )
+
+    else:
+
+        for metric in EXTRA_METRICS:
+            df_main[metric] = 0
+
+    # Missing revenue values become zero.
+    for metric in EXTRA_METRICS:
+        df_main[metric] = (
+            pd.to_numeric(
+                df_main[metric],
+                errors="coerce",
+            ).fillna(0)
+        )
 
     logging.info(
-        "Fetching GA4 advertising data from %s to %s",
+        "Main GA4 report completed: %s rows.",
+        len(df_main),
+    )
+
+    return df_main
+
+
+# ==================================================
+# 7. FETCH ADVERTISING DATA
+# ==================================================
+
+def pull_ads_data(client):
+
+    today = date.today()
+
+    end_date = today - timedelta(days=1)
+
+    start_date = end_date - timedelta(
+        days=DAYS_BACK - 1
+    )
+
+    logging.info(
+        "Fetching advertising data from %s to %s",
         start_date,
         end_date,
     )
 
     try:
+
         df = fetch_ga4_report(
             client=client,
             dimensions=ADS_DIMENSIONS,
@@ -264,13 +347,17 @@ def pull_ads_data(client):
             end_date=end_date.isoformat(),
         )
 
+        logging.info(
+            "Advertising report completed: %s rows.",
+            len(df),
+        )
+
         return df
 
     except Exception as error:
+
         logging.warning(
-            "Advertising metrics could not be fetched. "
-            "Check GA4 advertising integrations and metric compatibility. "
-            "Details: %s",
+            "Advertising report unavailable: %s",
             error,
         )
 
@@ -279,33 +366,37 @@ def pull_ads_data(client):
         )
 
 
-# --------------------------------------------------
-# DATA CLEANING AND FEATURES
-# --------------------------------------------------
+# ==================================================
+# 8. DATA CLEANING
+# ==================================================
 
 def clean_data(df):
-    """Convert GA4 values into useful data types."""
 
     if df.empty:
         return df
 
     df = df.copy()
 
-    # Format GA4 date from YYYYMMDD to YYYY-MM-DD.
+    # Convert GA4 date.
     if "date" in df.columns:
+
         df["date"] = pd.to_datetime(
             df["date"],
             format="%Y%m%d",
             errors="coerce",
         ).dt.strftime("%Y-%m-%d")
 
-    # Convert numeric columns.
+    # Convert metric columns to numbers.
+    dimension_columns = (
+        MAIN_DIMENSIONS + ADS_DIMENSIONS
+    )
+
     for column in df.columns:
 
         if column == "date":
             continue
 
-        if column in MAIN_DIMENSIONS or column in ADS_DIMENSIONS:
+        if column in dimension_columns:
             continue
 
         df[column] = pd.to_numeric(
@@ -316,78 +407,101 @@ def clean_data(df):
     return df
 
 
+# ==================================================
+# 9. ADD MAIN REPORT FEATURES
+# ==================================================
+
 def add_main_features(df):
-    """Add calculated columns to the main report."""
 
     if df.empty:
         return df
 
     df = df.copy()
 
-    df["date"] = pd.to_datetime(
+    date_column = pd.to_datetime(
         df["date"],
         errors="coerce",
     )
 
-    df["day_name"] = df["date"].dt.day_name()
-    df["week"] = df["date"].dt.isocalendar().week.astype("Int64")
-    df["month"] = df["date"].dt.strftime("%Y-%m")
+    df["day_name"] = date_column.dt.day_name()
 
+    df["week"] = (
+        date_column.dt.isocalendar().week
+    )
+
+    df["month"] = date_column.dt.strftime("%Y-%m")
+
+    # Conversion rate.
     df["conversion_rate"] = (
-        df["keyEvents"] / df["sessions"].replace(0, pd.NA)
-    ).fillna(0)
+        df["keyEvents"]
+        .div(df["sessions"].replace(0, float("nan")))
+        .fillna(0)
+    )
 
+    # Sessions per user.
     df["sessions_per_user"] = (
-        df["sessions"] / df["totalUsers"].replace(0, pd.NA)
-    ).fillna(0)
-
-    df["date"] = df["date"].dt.strftime("%Y-%m-%d")
+        df["sessions"]
+        .div(df["totalUsers"].replace(0, float("nan")))
+        .fillna(0)
+    )
 
     return df
 
 
+# ==================================================
+# 10. ADD ADVERTISING FEATURES
+# ==================================================
+
 def add_ads_features(df):
-    """Add calculated columns to the advertising report."""
 
     if df.empty:
         return df
 
     df = df.copy()
 
-    if "advertiserAdCost" in df.columns:
-        df["cost"] = df["advertiserAdCost"]
+    df["cost"] = df["advertiserAdCost"]
 
-    if "advertiserAdClicks" in df.columns:
-        df["clicks"] = df["advertiserAdClicks"]
+    df["clicks"] = df["advertiserAdClicks"]
 
-    if "advertiserAdImpressions" in df.columns:
-        df["impressions"] = df["advertiserAdImpressions"]
+    df["impressions"] = df["advertiserAdImpressions"]
 
     return df
 
 
-# --------------------------------------------------
-# GOOGLE SHEETS HELPERS
-# --------------------------------------------------
+# ==================================================
+# 11. GOOGLE SHEETS WORKSHEET
+# ==================================================
 
-def get_or_create_worksheet(spreadsheet, title):
-    """Get a worksheet or create it if it doesn't exist."""
+def get_or_create_worksheet(
+    spreadsheet,
+    title,
+):
 
     try:
-        return spreadsheet.worksheet(title)
+
+        worksheet = spreadsheet.worksheet(title)
 
     except gspread.WorksheetNotFound:
-        logging.info("Creating worksheet: %s", title)
 
-        return spreadsheet.add_worksheet(
+        logging.info(
+            "Creating worksheet: %s",
+            title,
+        )
+
+        worksheet = spreadsheet.add_worksheet(
             title=title,
             rows=1000,
             cols=50,
         )
 
+    return worksheet
+
+
+# ==================================================
+# 12. READ EXISTING SHEET DATA
+# ==================================================
 
 def read_existing_data(worksheet):
-    """Read existing worksheet data safely."""
 
     records = worksheet.get_all_records()
 
@@ -397,50 +511,65 @@ def read_existing_data(worksheet):
     return pd.DataFrame(records)
 
 
+# ==================================================
+# 13. MERGE OLD AND NEW DATA
+# ==================================================
+
 def merge_with_existing(
     new_df,
     old_df,
     key_columns,
 ):
-    """
-    Preserve older dates while replacing refreshed records.
-    Handles changes to the worksheet column structure.
-    """
+
+    new_df = new_df.copy()
 
     if old_df.empty:
-        return new_df.copy()
+        return new_df
 
-    # Keep only columns that exist in the new report.
-    # This avoids KeyError when the schema has changed.
+    old_df = old_df.copy()
+
+    # Add missing columns to old data.
     for column in new_df.columns:
+
         if column not in old_df.columns:
             old_df[column] = pd.NA
 
+    # Add missing columns to new data.
     for column in old_df.columns:
+
         if column not in new_df.columns:
             new_df[column] = pd.NA
 
+    # Match column structure.
     old_df = old_df[new_df.columns]
 
-    # Remove old records for dates being refreshed.
-    refreshed_dates = new_df["date"].dropna().unique()
+    # Remove dates that are being refreshed.
+    refreshed_dates = (
+        new_df["date"]
+        .dropna()
+        .astype(str)
+        .unique()
+    )
 
     old_df = old_df[
-        ~old_df["date"].astype(str).isin(
-            refreshed_dates.astype(str)
-        )
+        ~old_df["date"]
+        .astype(str)
+        .isin(refreshed_dates)
     ]
 
+    # Combine old and new records.
     combined = pd.concat(
         [old_df, new_df],
         ignore_index=True,
     )
 
+    # Remove duplicates.
     combined = combined.drop_duplicates(
         subset=key_columns,
         keep="last",
     )
 
+    # Sort data.
     combined = combined.sort_values(
         by=key_columns,
         na_position="last",
@@ -449,33 +578,58 @@ def merge_with_existing(
     return combined
 
 
+# ==================================================
+# 14. PREPARE GOOGLE SHEETS VALUES
+# ==================================================
+
 def prepare_sheet_values(df):
-    """Convert DataFrame into Google Sheets-compatible values."""
 
     df = df.copy()
 
     df = df.astype(object)
-    df = df.where(pd.notna(df), "")
 
-    values = [df.columns.tolist()]
+    df = df.where(
+        pd.notna(df),
+        "",
+    )
+
+    values = [
+        df.columns.tolist()
+    ]
 
     for row in df.values.tolist():
-        values.append([
-            value.item() if hasattr(value, "item") else value
-            for value in row
-        ])
+
+        clean_row = []
+
+        for value in row:
+
+            if hasattr(value, "item"):
+                value = value.item()
+
+            clean_row.append(value)
+
+        values.append(clean_row)
 
     return values
 
 
-def write_to_sheet(spreadsheet, df, tab_name):
-    """Merge and write data into a Google Sheets tab."""
+# ==================================================
+# 15. WRITE DATA TO GOOGLE SHEETS
+# ==================================================
+
+def write_to_sheet(
+    spreadsheet,
+    df,
+    tab_name,
+):
 
     if df.empty:
+
         logging.warning(
-            "No new data to write to %s.",
+            "No data available for tab %s.",
             tab_name,
         )
+
         return
 
     worksheet = get_or_create_worksheet(
@@ -486,26 +640,33 @@ def write_to_sheet(spreadsheet, df, tab_name):
     old_df = read_existing_data(worksheet)
 
     if tab_name == MAIN_TAB:
+
         keys = MAIN_KEYS
+
     else:
+
         keys = ADS_KEYS
 
     combined_df = merge_with_existing(
-        new_df=df.copy(),
-        old_df=old_df.copy(),
+        new_df=df,
+        old_df=old_df,
         key_columns=keys,
     )
 
-    values = prepare_sheet_values(combined_df)
+    values = prepare_sheet_values(
+        combined_df
+    )
 
-    # Resize before writing.
+    # Resize worksheet.
     worksheet.resize(
         rows=max(len(values), 100),
         cols=max(len(values[0]), 1),
     )
 
+    # Clear previous contents.
     worksheet.clear()
 
+    # Write updated data.
     worksheet.update(
         values=values,
         range_name="A1",
@@ -513,20 +674,26 @@ def write_to_sheet(spreadsheet, df, tab_name):
     )
 
     logging.info(
-        "Updated tab '%s' with %s records and %s columns.",
+        "Successfully updated %s.",
         tab_name,
+    )
+
+    logging.info(
+        "Rows: %s | Columns: %s",
         len(combined_df),
         len(combined_df.columns),
     )
 
 
-# --------------------------------------------------
-# MAIN
-# --------------------------------------------------
+# ==================================================
+# 16. MAIN EXECUTION
+# ==================================================
 
 def main():
 
-    logging.info("Starting GA4 to Google Sheets automation.")
+    logging.info(
+        "Starting GA4 to Google Sheets automation."
+    )
 
     if not PROPERTY_ID:
         raise ValueError("GA_PROPERTY_ID is missing.")
@@ -534,43 +701,76 @@ def main():
     if not SHEET_ID:
         raise ValueError("SHEET_ID is missing.")
 
+    # Connect to services.
     ga_client, spreadsheet = connect_services()
 
-    # Main traffic and campaign data.
-    main_df = pull_main_data(ga_client)
+    # ----------------------------------------------
+    # MAIN GA4 DATA
+    # ----------------------------------------------
+
+    main_df = pull_main_data(
+        ga_client
+    )
 
     if not main_df.empty:
-        main_df = clean_data(main_df)
-        main_df = add_main_features(main_df)
+
+        main_df = clean_data(
+            main_df
+        )
+
+        main_df = add_main_features(
+            main_df
+        )
 
         write_to_sheet(
-            spreadsheet,
-            main_df,
-            MAIN_TAB,
+            spreadsheet=spreadsheet,
+            df=main_df,
+            tab_name=MAIN_TAB,
         )
-    else:
-        logging.warning("No main GA4 data returned.")
 
-    # Advertising metrics in a separate tab.
-    ads_df = pull_ads_data(ga_client)
+    # ----------------------------------------------
+    # ADVERTISING DATA
+    # ----------------------------------------------
+
+    ads_df = pull_ads_data(
+        ga_client
+    )
 
     if not ads_df.empty:
-        ads_df = clean_data(ads_df)
-        ads_df = add_ads_features(ads_df)
+
+        ads_df = clean_data(
+            ads_df
+        )
+
+        ads_df = add_ads_features(
+            ads_df
+        )
 
         write_to_sheet(
-            spreadsheet,
-            ads_df,
-            ADS_TAB,
-        )
-    else:
-        logging.warning(
-            "No advertising data returned. "
-            "The main GA4 report has still been processed."
+            spreadsheet=spreadsheet,
+            df=ads_df,
+            tab_name=ADS_TAB,
         )
 
-    logging.info("GA4 automation completed.")
+    logging.info(
+        "GA4 automation completed successfully."
+    )
 
+
+# ==================================================
+# 17. RUN SCRIPT
+# ==================================================
 
 if __name__ == "__main__":
-    main()
+
+    try:
+
+        main()
+
+    except Exception:
+
+        logging.exception(
+            "GA4 automation failed."
+        )
+
+        raise
