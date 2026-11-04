@@ -1,0 +1,10 @@
+pandas
+numpy
+gspread==6.2.1
+gspread-formatting==1.2.1
+gspread-dataframe==4.0.0
+google-auth
+google-cloud-storage
+nbconvert
+ipykernel
+google-analytics-data pandas
